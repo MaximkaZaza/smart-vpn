@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler, AppError } = require('../middleware/errorHandler');
 const { User, Subscription, Transaction, Server, Plan } = require('../models');
 const { Op } = require('sequelize');
+const deploymentService = require('../services/server-deployment.service');
+const healthMonitor = require('../services/server-health.service');
+const { body, validationResult } = require('express-validator');
 
 // All routes require admin authentication
 router.use(authenticate);
@@ -181,6 +184,314 @@ router.put('/plans/:id', asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: { plan }
+  });
+}));
+
+/**
+ * @route   GET /api/admin/servers
+ * @desc    Get all servers
+ * @access  Private/Admin
+ */
+router.get('/servers', asyncHandler(async (req, res) => {
+  const servers = await Server.findAll({
+    order: [['createdAt', 'DESC']]
+  });
+
+  res.json({
+    success: true,
+    data: { servers }
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers
+ * @desc    Add new server with auto-deployment
+ * @access  Private/Admin
+ */
+router.post('/servers', [
+  body('name').notEmpty().withMessage('Server name is required'),
+  body('ipAddress').isIP().withMessage('Valid IP address is required'),
+  body('region').notEmpty().withMessage('Region is required'),
+  body('country').notEmpty().withMessage('Country is required'),
+  body('sshUsername').notEmpty().withMessage('SSH username is required'),
+  body('sshPassword').optional(),
+  body('sshPrivateKey').optional()
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    throw new AppError(errors.array()[0].msg, 400, 'VALIDATION_ERROR');
+  }
+
+  const {
+    name, region, country, ipAddress, port = 443,
+    sshUsername, sshPassword, sshPrivateKey, sshPort = 22,
+    domain, adminEmail, dbHost, dbPassword
+  } = req.body;
+
+  // Create server record
+  const server = await Server.create({
+    name,
+    region,
+    country,
+    ipAddress,
+    port,
+    healthStatus: 'unknown',
+    config: {
+      sshUsername,
+      sshPort,
+      domain,
+      dbHost,
+      dbPassword
+    }
+  });
+
+  // Deploy Xray on server
+  const deploymentResult = await deploymentService.deployServer({
+    ipAddress,
+    username: sshUsername,
+    password: sshPassword,
+    privateKey: sshPrivateKey,
+    sshPort,
+    domain,
+    adminEmail,
+    dbHost,
+    dbPassword
+  });
+
+  if (deploymentResult.success) {
+    await server.update({
+      healthStatus: 'healthy',
+      lastHealthCheck: new Date()
+    });
+  } else {
+    await server.update({
+      healthStatus: 'unhealthy'
+    });
+  }
+
+  res.status(201).json({
+    success: true,
+    data: {
+      server,
+      deployment: deploymentResult
+    }
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers/deploy-multiple
+ * @desc    Deploy multiple servers at once
+ * @access  Private/Admin
+ */
+router.post('/servers/deploy-multiple', asyncHandler(async (req, res) => {
+  const { servers } = req.body;
+
+  if (!Array.isArray(servers) || servers.length === 0) {
+    throw new AppError('Servers array is required', 400, 'VALIDATION_ERROR');
+  }
+
+  const results = await deploymentService.deployMultipleServers(servers);
+
+  // Create server records in database
+  const createdServers = [];
+  for (const result of results) {
+    if (result.success) {
+      const server = await Server.create({
+        name: result.server.name,
+        region: result.server.region,
+        country: result.server.country,
+        ipAddress: result.server.ipAddress,
+        healthStatus: 'healthy',
+        lastHealthCheck: new Date(),
+        config: result.server.config
+      });
+      createdServers.push(server);
+    }
+  }
+
+  res.json({
+    success: true,
+    data: {
+      results,
+      createdServers
+    }
+  });
+}));
+
+/**
+ * @route   PUT /api/admin/servers/:id
+ * @desc    Update server
+ * @access  Private/Admin
+ */
+router.put('/servers/:id', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  const updatableFields = [
+    'name', 'region', 'country', 'ipAddress', 'port',
+    'protocol', 'isActive', 'isPrimary', 'maxConnections', 'config'
+  ];
+
+  for (const field of updatableFields) {
+    if (req.body[field] !== undefined) {
+      server[field] = req.body[field];
+    }
+  }
+
+  await server.save();
+
+  res.json({
+    success: true,
+    data: { server }
+  });
+}));
+
+/**
+ * @route   DELETE /api/admin/servers/:id
+ * @desc    Delete server
+ * @access  Private/Admin
+ */
+router.delete('/servers/:id', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  // Check if server has active subscriptions
+  const activeSubscriptions = await Subscription.count({
+    where: { serverId: server.id, isActive: true }
+  });
+
+  if (activeSubscriptions > 0) {
+    throw new AppError(
+      `Cannot delete server with ${activeSubscriptions} active subscriptions`,
+      400,
+      'SERVER_HAS_SUBSCRIPTIONS'
+    );
+  }
+
+  await server.destroy();
+
+  res.json({
+    success: true,
+    message: 'Server deleted successfully'
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers/:id/health-check
+ * @desc    Check server health
+ * @access  Private/Admin
+ */
+router.post('/servers/:id/health-check', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  const health = await deploymentService.checkServerHealth(server);
+
+  res.json({
+    success: true,
+    data: {
+      serverId: server.id,
+      healthy: health.healthy,
+      lastCheck: new Date()
+    }
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers/:id/add-client
+ * @desc    Add client to server
+ * @access  Private/Admin
+ */
+router.post('/servers/:id/add-client', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+  const { clientUuid, sshCredentials } = req.body;
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  if (!clientUuid || !sshCredentials) {
+    throw new AppError('clientUuid and sshCredentials are required', 400, 'VALIDATION_ERROR');
+  }
+
+  const result = await deploymentService.addClientToServer(
+    server.ipAddress,
+    clientUuid,
+    sshCredentials
+  );
+
+  res.json({
+    success: true,
+    data: { result }
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers/:id/remove-client
+ * @desc    Remove client from server
+ * @access  Private/Admin
+ */
+router.post('/servers/:id/remove-client', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+  const { clientUuid, sshCredentials } = req.body;
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  const result = await deploymentService.removeClientFromServer(
+    server.ipAddress,
+    clientUuid,
+    sshCredentials
+  );
+
+  res.json({
+    success: true,
+    data: { result }
+  });
+}));
+
+/**
+ * @route   GET /api/admin/servers/health-stats
+ * @desc    Get servers health statistics
+ * @access  Private/Admin
+ */
+router.get('/servers/health-stats', asyncHandler(async (req, res) => {
+  const stats = await healthMonitor.getHealthStats();
+
+  res.json({
+    success: true,
+    data: { stats }
+  });
+}));
+
+/**
+ * @route   POST /api/admin/servers/:id/restart
+ * @desc    Restart unhealthy server
+ * @access  Private/Admin
+ */
+router.post('/servers/:id/restart', asyncHandler(async (req, res) => {
+  const server = await Server.findByPk(req.params.id);
+  const { sshCredentials } = req.body;
+
+  if (!server) {
+    throw new AppError('Server not found', 404, 'SERVER_NOT_FOUND');
+  }
+
+  const result = await healthMonitor.restartUnhealthyServer(server.id, sshCredentials);
+
+  res.json({
+    success: true,
+    data: { result }
   });
 }));
 

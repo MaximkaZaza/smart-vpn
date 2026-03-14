@@ -4,8 +4,8 @@
 
 require('dotenv').config();
 
-const { Telegraf, Markup } = require('telegraf');
-const { sequelize, User, Subscription, Plan, Transaction } = require('../models');
+const { Telegraf, Markup, session } = require('telegraf');
+const { sequelize, User, Subscription, Plan, Transaction, Server } = require('../models');
 const logger = require('../config/logger');
 const { generateVLESSConfig } = require('../services/xray.service');
 const { getOrCreateUser } = require('../utils/bot.helpers');
@@ -17,6 +17,9 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 }
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+
+// Setup session
+bot.use(session());
 
 // Bot commands
 bot.command('start', async (ctx) => {
@@ -172,9 +175,25 @@ async function handleTariffs(ctx) {
     return ctx.reply('❌ Тарифы временно недоступны.');
   }
 
-  const keyboard = plans.map(plan => 
-    [Markup.button.callback(`💳 ${plan.name} - ${plan.price} RUB`, `buy_${plan.id}`)]
-  );
+  // Get available servers
+  const servers = await Server.findAll({
+    where: { isActive: true, healthStatus: 'healthy' },
+    attributes: ['id', 'name', 'country', 'loadPercentage']
+  });
+
+  const keyboard = [];
+  
+  // Add server selection if multiple servers available
+  if (servers.length > 1) {
+    keyboard.push(
+      [Markup.button.callback('🌍 Выбрать сервер', 'select_server')]
+    );
+  }
+  
+  // Add plan buttons
+  plans.forEach(plan => {
+    keyboard.push([Markup.button.callback(`💳 ${plan.name} - ${plan.price} RUB`, `buy_${plan.id}`)]);
+  });
 
   let message = '💰 *Доступные тарифы:*\n\n';
   
@@ -184,6 +203,13 @@ async function handleTariffs(ctx) {
     message += `   📱 Устройств: ${plan.deviceLimit}\n`;
     message += `   ⏱ Период: ${plan.durationDays} дн.\n\n`;
   });
+
+  if (servers.length > 0) {
+    message += `\n🌍 *Доступные серверы:* ${servers.length}\n`;
+    servers.slice(0, 3).forEach(s => {
+      message += `   • ${s.name} (${s.country}) - загрузка ${s.loadPercentage}%\n`;
+    });
+  }
 
   await ctx.reply(message, { 
     parse_mode: 'Markdown',
@@ -310,9 +336,35 @@ bot.on('callback_query', async (ctx) => {
 
       const user = await User.findOne({ where: { telegramId: ctx.from.id } });
       
+      // Store selected plan in session
+      ctx.session.selectedPlan = planId;
+      
       if (user.balance >= plan.price) {
-        await ctx.answerCbQuery('✅ Оплата прошла успешно!');
-        // Activate subscription logic here
+        // Check if multiple servers available
+        const servers = await Server.findAll({
+          where: { isActive: true, healthStatus: 'healthy' }
+        });
+
+        if (servers.length > 1) {
+          // Show server selection
+          const serverKeyboard = servers.map(s => 
+            [Markup.button.callback(`🌍 ${s.name} (${s.country})`, `server_${s.id}`)]
+          );
+          serverKeyboard.push([Markup.button.callback('⚡ Автовыбор', 'server_auto')]);
+          
+          await ctx.answerCbQuery();
+          await ctx.reply(
+            '🌍 *Выберите сервер:*\n\n' +
+            'Серверы с наименьшей нагрузкой обеспечат лучшую скорость.',
+            { 
+              parse_mode: 'Markdown',
+              ...Markup.inlineKeyboard(serverKeyboard)
+            }
+          );
+        } else {
+          // Single server or auto-select
+          await activateSubscription(ctx, user, plan.id, null);
+        }
       } else {
         await ctx.answerCbQuery('❌ Недостаточно средств', { show_alert: true });
         await ctx.reply('💳 Недостаточно средств на балансе.\n\n' +
@@ -320,6 +372,14 @@ bot.on('callback_query', async (ctx) => {
           `Ваш баланс: ${user.balance} RUB\n\n` +
           'Пополните баланс в разделе «💳 Пополнить баланс».');
       }
+    } else if (data.startsWith('server_')) {
+      // Server selection
+      const serverId = data.split('_')[1];
+      const planId = ctx.session.selectedPlan;
+      const user = await User.findOne({ where: { telegramId: ctx.from.id } });
+      
+      await ctx.answerCbQuery();
+      await activateSubscription(ctx, user, planId, serverId === 'auto' ? null : serverId);
     } else if (data.startsWith('topup_')) {
       const amount = data.split('_')[1];
       await ctx.answerCbQuery();
@@ -337,6 +397,91 @@ bot.on('callback_query', async (ctx) => {
     ctx.answerCbQuery('❌ Произошла ошибка');
   }
 });
+
+/**
+ * Activate subscription helper
+ */
+async function activateSubscription(ctx, user, planId, serverId = null) {
+  try {
+    const plan = await Plan.findByPk(planId);
+    const server = serverId 
+      ? await Server.findByPk(serverId)
+      : await Server.findOne({
+          where: { isActive: true, healthStatus: 'healthy' },
+          order: [['loadPercentage', 'ASC']]
+        });
+
+    if (!server) {
+      return ctx.reply('❌ Нет доступных серверов');
+    }
+
+    // Create subscription
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + plan.getDurationDays());
+
+    const subscription = await Subscription.create({
+      userId: user.id,
+      planId: plan.id,
+      vlessUuid: require('uuid').v4(),
+      endDate,
+      trafficLimitGB: plan.trafficLimitGB,
+      deviceLimit: plan.deviceLimit,
+      serverId: server.id
+    });
+
+    // Deduct balance
+    user.balance = parseFloat(user.balance) - parseFloat(plan.price);
+    await user.save();
+
+    // Update server load
+    server.currentConnections += 1;
+    server.loadPercentage = (server.currentConnections / server.maxConnections) * 100;
+    await server.save();
+
+    // Generate VLESS config
+    const config = generateVLESSConfig({
+      uuid: subscription.vlessUuid,
+      server,
+      subscription
+    });
+
+    // Send success message
+    await ctx.answerCbQuery('✅ Оплата прошла успешно!');
+    await ctx.reply(
+      '✅ *Подписка активирована!*\n\n' +
+      `Тариф: *${plan.name}*\n` +
+      `Сервер: *${server.name}* (${server.country})\n` +
+      `Срок действия: *${subscription.getRemainingDays()} дн.*\n` +
+      `Трафик: *${plan.trafficLimitGB} GB*\n\n` +
+      'Отправляю конфигурацию...',
+      { parse_mode: 'Markdown' }
+    );
+
+    // Send QR code
+    await ctx.replyWithPhoto({ source: Buffer.from(config.qrCode.replace('data:image/png;base64,', ''), 'base64') });
+    
+    // Send VLESS link
+    await ctx.reply(`\`${config.link}\``, { parse_mode: 'Markdown' });
+    
+    // Send instructions
+    await ctx.reply(
+      '📱 *Как подключить:*\n\n' +
+      '1. Скачайте приложение:\n' +
+      '   • Android: V2RayNG\n' +
+      '   • iOS: Shadowrocket\n' +
+      '   • Windows: v2rayN\n\n' +
+      '2. Отсканируйте QR-код или используйте ссылку\n\n' +
+      '3. Подключитесь к серверу\n\n' +
+      '📞 Поддержка: @vpn_support',
+      { parse_mode: 'Markdown' }
+    );
+
+  } catch (error) {
+    logger.error('Failed to activate subscription:', error);
+    await ctx.answerCbQuery('❌ Ошибка активации', { show_alert: true });
+    await ctx.reply('❌ Произошла ошибка при активации подписки. Попробуйте позже.');
+  }
+}
 
 // Error handling
 bot.catch((err, ctx) => {

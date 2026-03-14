@@ -18,6 +18,7 @@ const { sequelize } = require('./models');
 const routes = require('./routes');
 const { errorHandler } = require('./middleware/errorHandler');
 const { requestLogger } = require('./middleware/logger');
+const healthMonitor = require('./services/server-health.service');
 
 // Logger setup
 const logger = winston.createLogger({
@@ -146,6 +147,12 @@ async function startServer() {
     });
     logger.info('Database synchronized.');
 
+    // Start health monitor
+    if (process.env.NODE_ENV === 'production') {
+      healthMonitor.start();
+      logger.info('Server health monitor started.');
+    }
+
     // Start server
     app.listen(PORT, '0.0.0.0', () => {
       logger.info(`Smart VPN Server running on port ${PORT}`);
@@ -155,11 +162,13 @@ async function startServer() {
     // Graceful shutdown
     process.on('SIGTERM', () => {
       logger.info('SIGTERM signal received: closing HTTP server');
+      healthMonitor.stop();
       process.exit(0);
     });
 
     process.on('SIGINT', () => {
       logger.info('SIGINT signal received: closing HTTP server');
+      healthMonitor.stop();
       process.exit(0);
     });
 
