@@ -1,0 +1,34 @@
+# Code Owners
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Общие владельцы
+* @yourusername
+
+# Исходный код
+/src/ @yourusername @lead-developer
+
+# Бот
+/src/bot/ @yourusername @bot-developer
+
+# Модели и база данных
+/src/models/ @yourusername @db-developer
+
+# API маршруты
+/src/routes/ @yourusername @api-developer
+
+# Конфигурация
+/config/ @yourusername @devops
+
+# Docker
+/Dockerfile @devops
+/docker-compose.yml @devops
+
+# CI/CD
+/.github/workflows/ @yourusername @devops
+
+# Тесты
+/tests/ @yourusername @qa-lead
+
+# Документация
+/docs/ @yourusername @tech-writer
+*.md @yourusername

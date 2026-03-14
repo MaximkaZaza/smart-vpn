@@ -1,0 +1,13 @@
+# Funding Configuration
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+github: yourusername
+patreon: yourusername
+open_collective: yourusername
+ko_fi: yourusername
+tidelift: npm/smart-vpn
+community_bridge: yourproject
+liberapay: yourusername
+issuehunt: yourusername
+otechie: yourusername
+custom: ["https://your-site.com/donate"]
